@@ -1,0 +1,60 @@
+name: Build plugin
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-2022
+            preset: windows-x64
+            artifact: propresenter-lyrics-windows-x64
+            archive: zip
+          - name: macOS Intel
+            runner: macos-13
+            preset: macos-x86_64
+            artifact: propresenter-lyrics-macos-x86_64
+            archive: zip
+          - name: macOS Apple Silicon
+            runner: macos-14
+            preset: macos-arm64
+            artifact: propresenter-lyrics-macos-arm64
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Install
+        run: cmake --install build/${{ matrix.preset }} --prefix dist/${{ matrix.preset }} --config RelWithDebInfo
+
+      - name: Package
+        shell: bash
+        run: |
+          cd dist/${{ matrix.preset }}
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            7z a ../../${{ matrix.artifact }}.zip .
+          else
+            zip -r ../../${{ matrix.artifact }}.zip .
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip

@@ -1,0 +1,55 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "windows-x64",
+      "inherits": "base",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/windows-x64"
+    },
+    {
+      "name": "macos-x86_64",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/macos-x86_64",
+      "cacheVariables": {
+        "CMAKE_OSX_ARCHITECTURES": "x86_64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "11.0"
+      }
+    },
+    {
+      "name": "macos-arm64",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/macos-arm64",
+      "cacheVariables": {
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "11.0"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-x64",
+      "configurePreset": "windows-x64",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "macos-x86_64",
+      "configurePreset": "macos-x86_64"
+    },
+    {
+      "name": "macos-arm64",
+      "configurePreset": "macos-arm64"
+    }
+  ]
+}
+

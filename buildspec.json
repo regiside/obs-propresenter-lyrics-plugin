@@ -1,0 +1,14 @@
+{
+  "name": "propresenter-lyrics",
+  "displayName": "ProPresenter Lyrics",
+  "version": "0.1.0",
+  "author": "Reginald",
+  "website": "https://example.com",
+  "email": "support@example.com",
+  "platformConfig": {
+    "macos": {
+      "bundleId": "com.reginald.obs-propresenter-lyrics"
+    }
+  }
+}
+
