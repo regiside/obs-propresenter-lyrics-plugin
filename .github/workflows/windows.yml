@@ -41,7 +41,7 @@ jobs:
         run: |
           $sdk = "$env:GITHUB_WORKSPACE/build/obs-sdk-source"
           $deps = "$sdk/.deps/obs-deps-2025-08-23-x64"
-          cmake --preset windows-x64 "-Dlibobs_DIR=$sdk/build_x64/libobs" "-DCMAKE_PREFIX_PATH=$deps" -DPROPRESENTER_BUILD_TESTS=ON
+          cmake --preset windows-x64 "-Dlibobs_DIR=$sdk/build_x64/libobs" "-DCMAKE_PREFIX_PATH=$deps" "-Dw32-pthreads_DIR=$sdk/build_x64/deps/w32-pthreads" "-DSIMDe_INCLUDE_DIR=$deps/include" -DPROPRESENTER_BUILD_TESTS=ON
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build plugin and tests
         run: cmake --build --preset windows-x64
