@@ -33,7 +33,7 @@ jobs:
           cmake --preset windows-x64
           -DENABLE_PLUGINS=OFF -DENABLE_FRONTEND=OFF
           -DENABLE_BROWSER=OFF -DENABLE_SCRIPTING=OFF
-          -DOBS_VERSION_OVERRIDE=32.1.2
+          "-DOBS_VERSION_OVERRIDE=32.1.2"
       - name: Build OBS SDK
         run: cmake --build build/obs-sdk-source/build_x64 --target libobs --config RelWithDebInfo --parallel 4
       - name: Configure plugin and tests
