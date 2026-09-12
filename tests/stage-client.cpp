@@ -56,7 +56,7 @@ static void fast(const char *label, const std::function<void()> &action)
 	auto start = std::chrono::steady_clock::now();
 	action();
 	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-	std::cout << label << ": " << elapsed << " ms\n";
+	std::cout << label << ": " << elapsed << " ms" << std::endl;
 	assert(elapsed < 300);
 }
 

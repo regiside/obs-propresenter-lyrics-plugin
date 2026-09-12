@@ -208,10 +208,56 @@ inline std::vector<sockaddr_storage> addresses(const std::string &host, int port
 			return found.values;
 		}
 #endif
+#ifdef _WIN32
+		// Use Windows asynchronous DNS when Bonjour is absent, so stopping a
+		// source does not wait for the system's synchronous resolver timeout.
+		if (cancel) return {};
+		int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, host.c_str(), -1, nullptr, 0);
+		if (!count) return {};
+		std::wstring wide_host(static_cast<size_t>(count), L'\0');
+		MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, host.c_str(), -1, wide_host.data(), count);
+		std::wstring wide_port = std::to_wstring(port);
+		ADDRINFOEXW async_hints{};
+		async_hints.ai_family = AF_UNSPEC;
+		async_hints.ai_socktype = SOCK_STREAM;
+		async_hints.ai_flags = AI_NUMERICSERV;
+		PADDRINFOEXW async_result = nullptr;
+		OVERLAPPED operation{};
+		operation.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		if (!operation.hEvent) return {};
+		HANDLE query = nullptr;
+		int status = GetAddrInfoExW(wide_host.c_str(), wide_port.c_str(), NS_DNS, nullptr,
+			&async_hints, &async_result, nullptr, &operation, nullptr, &query);
+		if (status == WSA_IO_PENDING) {
+			auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+			while (WaitForSingleObject(operation.hEvent, 50) == WAIT_TIMEOUT) {
+				if (cancel || std::chrono::steady_clock::now() >= deadline) {
+					GetAddrInfoExCancel(&query);
+					// Cancellation signals completion; keep the overlapped storage
+					// alive until Windows has finished accessing it.
+					WaitForSingleObject(operation.hEvent, INFINITE);
+					break;
+				}
+			}
+			status = GetAddrInfoExOverlappedResult(&operation);
+		}
+		if (!status && !cancel) {
+			for (auto *entry = async_result; entry; entry = entry->ai_next) {
+				if (entry->ai_addrlen > sizeof(sockaddr_storage)) continue;
+				sockaddr_storage address{};
+				memcpy(&address, entry->ai_addr, entry->ai_addrlen);
+				values.push_back(address);
+			}
+		}
+		if (async_result) FreeAddrInfoExW(async_result);
+		CloseHandle(operation.hEvent);
+		return values;
+#else
 		// Manual hostname support without a DNS-SD runtime. This lookup runs
 		// only on the connection worker, never in OBS's settings callback.
 		hints.ai_flags = AI_NUMERICSERV;
 		if (cancel || getaddrinfo(host.c_str(), port_text.c_str(), &hints, &result)) return {};
+#endif
 	}
 	for (auto *entry = result; entry && !cancel; entry = entry->ai_next) {
 		if (entry->ai_addrlen > sizeof(sockaddr_storage)) continue;
