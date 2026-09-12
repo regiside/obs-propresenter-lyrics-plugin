@@ -65,11 +65,21 @@ endif()
 
 find_package(libobs REQUIRED CONFIG)
 
+# Tabs add an enum value, not a new exported function. Keep the baseline SDK
+# so the plugin can still load in older OBS versions and display normal groups.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_LIBRARIES OBS::libobs)
+check_cxx_source_compiles("#include <obs-properties.h>
+int main() { return static_cast<int>(OBS_GROUP_TAB); }" PROPRESENTER_HAS_OBS_GROUP_TAB)
+unset(CMAKE_REQUIRED_LIBRARIES)
+configure_file(src/obs-tabs-compat.hpp.in generated/obs-tabs-compat.hpp)
+
 add_library(propresenter-lyrics MODULE
   src/propresenter-lyrics.cpp
 )
 
 target_link_libraries(propresenter-lyrics PRIVATE OBS::libobs)
+target_include_directories(propresenter-lyrics PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 if(WIN32)
   target_link_libraries(propresenter-lyrics PRIVATE ws2_32)
@@ -116,4 +126,29 @@ else()
   )
   install(DIRECTORY data/ DESTINATION "propresenter-lyrics/data")
   install(FILES icon/plugin-icon.svg DESTINATION "propresenter-lyrics/data/icon")
+endif()
+
+option(PROPRESENTER_BUILD_TESTS "Build standalone network regression tests" OFF)
+if(PROPRESENTER_BUILD_TESTS)
+  enable_testing()
+  add_executable(stage-client-test tests/stage-client.cpp)
+  target_link_libraries(stage-client-test PRIVATE OBS::libobs)
+  target_include_directories(stage-client-test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  target_compile_definitions(stage-client-test PRIVATE PROJECT_VERSION="${PROJECT_VERSION}")
+  add_executable(stage-discovery-test tests/stage-discovery.cpp)
+  if(WIN32)
+    target_link_libraries(stage-client-test PRIVATE ws2_32)
+    target_link_libraries(stage-discovery-test PRIVATE ws2_32)
+  endif()
+  # These checks use assertions even in release builds.
+  if(MSVC)
+    target_compile_options(stage-client-test PRIVATE /UNDEBUG)
+    target_compile_options(stage-discovery-test PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(stage-client-test PRIVATE -UNDEBUG)
+    target_compile_options(stage-discovery-test PRIVATE -UNDEBUG)
+  endif()
+  add_test(NAME stage-client-responsiveness COMMAND stage-client-test)
+  add_test(NAME stage-discovery COMMAND stage-discovery-test)
+  set_tests_properties(stage-client-responsiveness stage-discovery PROPERTIES TIMEOUT 30)
 endif()

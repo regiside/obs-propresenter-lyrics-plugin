@@ -1,8 +1,11 @@
 #include <obs-module.h>
+#include "obs-tabs-compat.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cerrno>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +24,9 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 using socket_handle = SOCKET;
@@ -35,6 +41,8 @@ static constexpr socket_handle invalid_socket_handle = INVALID_SOCKET;
 using socket_handle = int;
 static constexpr socket_handle invalid_socket_handle = -1;
 #endif
+
+#include "stage-discovery.hpp"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("propresenter-lyrics", "en-US")
@@ -428,11 +436,13 @@ struct Style {
 	int shadow_y = 3;
 	int shadow_blur = 14;
 	bool line_background_enabled = false;
+	bool line_background_hide_when_empty = false;
 	uint32_t line_background_color = 0xFF000000;
 	int line_background_opacity = 45;
 	int line_background_padding_x = 14;
 	int line_background_padding_y = 4;
 	int line_background_radius = 2;
+	int line_gap = 0;
 	bool crossfade_enabled = true;
 	int crossfade_ms = 350;
 };
@@ -475,10 +485,12 @@ static std::string style_to_json(const Style &style)
 	out << "\"shadow_y\":" << style.shadow_y << ",";
 	out << "\"shadow_blur\":" << style.shadow_blur << ",";
 	out << "\"line_background_enabled\":" << (style.line_background_enabled ? "true" : "false") << ",";
+	out << "\"line_background_hide_when_empty\":" << (style.line_background_hide_when_empty ? "true" : "false") << ",";
 	out << "\"line_background_color\":\"" << color_to_css(style.line_background_color) << "\",";
 	out << "\"line_background_opacity\":" << style.line_background_opacity << ",";
 	out << "\"line_background_padding_x\":" << style.line_background_padding_x << ",";
 	out << "\"line_background_padding_y\":" << style.line_background_padding_y << ",";
+	out << "\"line_gap\":" << style.line_gap << ",";
 	out << "\"line_background_radius\":" << style.line_background_radius << ",";
 	out << "\"crossfade_enabled\":" << (style.crossfade_enabled ? "true" : "false") << ",";
 	out << "\"crossfade_ms\":" << style.crossfade_ms;
@@ -487,8 +499,8 @@ static std::string style_to_json(const Style &style)
 }
 
 struct Settings {
-	std::string settings_tab = "connection";
 	std::string host = "127.0.0.1";
+	std::string service_id;
 	int port = 50001;
 	std::string password;
 	std::string api_mode = "stage_with_http_fallback";
@@ -542,7 +554,9 @@ private:
 
 class LogStore {
 public:
-	LogStore() : path_(module_config_file_path("propresenter-lyrics.log")) {}
+	LogStore() : LogStore(module_config_file_path("propresenter-lyrics.log")) {}
+	explicit LogStore(std::string path) : path_(std::move(path)) {}
+	uint64_t revision() const { return revision_.load(); }
 
 	void add(const std::string &message)
 	{
@@ -552,6 +566,7 @@ public:
 		lines_.push_back(line.str());
 		if (lines_.size() > 120)
 			lines_.erase(lines_.begin(), lines_.begin() + static_cast<long>(lines_.size() - 120));
+		++revision_;
 		append_file_locked(line.str());
 		blog(LOG_INFO, "[propresenter-lyrics] %s", message.c_str());
 	}
@@ -577,6 +592,7 @@ public:
 	}
 
 private:
+	std::atomic<uint64_t> revision_{0};
 	static constexpr uintmax_t max_log_bytes = 256 * 1024;
 	static constexpr uintmax_t trim_to_bytes = 192 * 1024;
 
@@ -641,7 +657,7 @@ private:
 static const char *overlay_html = R"HTML(<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-html,body{width:100%;height:100%;margin:0;overflow:hidden;background:transparent}#stage{position:fixed;inset:0;overflow:hidden;background:transparent}.layer{position:absolute;inset:0;box-sizing:border-box;padding:var(--layer-padding,0);opacity:0;transition-property:opacity;transition-duration:var(--crossfade-duration,0ms);transition-timing-function:ease;will-change:opacity}.layer.visible{opacity:1}.content{width:100%;height:100%;box-sizing:border-box;overflow:hidden;display:flex;line-height:var(--line-height,1.15);color:var(--text-color,#fff);opacity:var(--text-opacity,1);font-family:var(--font-family,Arial),sans-serif;font-size:var(--font-size,72px);font-weight:var(--font-weight,700);font-style:var(--font-style,normal);letter-spacing:var(--letter-spacing,0);text-align:var(--text-align,center);text-transform:var(--text-transform,none);text-shadow:var(--text-shadow,none);white-space:pre-wrap;overflow-wrap:anywhere}.content.no-wrap{white-space:pre;overflow-wrap:normal}.content.shrink-to-fit{justify-content:var(--content-justify,center);align-items:var(--content-align,center)}.content:not(.shrink-to-fit){flex-direction:column;justify-content:var(--content-align,center);align-items:var(--content-justify,center)}.content:not(.shrink-to-fit) .line{max-width:100%;min-width:0}.content.shrink-to-fit .textFitted{max-width:100%;white-space:pre-wrap}.content.shrink-to-fit.no-wrap .textFitted{white-space:pre}.line{display:inline;box-decoration-break:clone;-webkit-box-decoration-break:clone;border-radius:var(--line-bg-radius,0);padding:var(--line-bg-pad-y,0) var(--line-bg-pad-x,0);background:var(--line-bg,transparent)}
+html,body{width:100%;height:100%;margin:0;overflow:hidden;background:transparent}#stage{position:fixed;inset:0;overflow:hidden;background:transparent}.layer{position:absolute;inset:0;box-sizing:border-box;padding:var(--layer-padding,0);opacity:0;transition-property:opacity;transition-duration:var(--crossfade-duration,0ms);transition-timing-function:ease;will-change:opacity}.layer.visible{opacity:1}.content{width:100%;height:100%;box-sizing:border-box;overflow:hidden;display:flex;line-height:var(--line-height,1.15);color:var(--text-color,#fff);opacity:var(--text-opacity,1);font-family:var(--font-family,Arial),sans-serif;font-size:var(--font-size,72px);font-weight:var(--font-weight,700);font-style:var(--font-style,normal);letter-spacing:var(--letter-spacing,0);text-align:var(--text-align,center);text-transform:var(--text-transform,none);text-shadow:var(--text-shadow,none);white-space:pre-wrap;overflow-wrap:anywhere}.content.no-wrap{white-space:pre;overflow-wrap:normal}.content.shrink-to-fit{justify-content:var(--content-justify,center);align-items:var(--content-align,center)}.content:not(.shrink-to-fit){flex-direction:column;justify-content:var(--content-align,center);align-items:var(--content-justify,center)}.content:not(.shrink-to-fit) .line{max-width:100%;min-width:0}.content.shrink-to-fit .textFitted{max-width:100%;white-space:pre-wrap}.content.shrink-to-fit.no-wrap .textFitted{white-space:pre}.has-line-gap .line{display:inline-block}.line:not(:last-child){margin-bottom:var(--line-gap,0px)}.hide-empty-lines .empty-line{display:none}.line{display:inline;box-decoration-break:clone;-webkit-box-decoration-break:clone;border-radius:var(--line-bg-radius,0);padding:var(--line-bg-pad-y,0) var(--line-bg-pad-x,0);background:var(--line-bg,transparent)}
 </style></head><body><main id="stage"><section id="a" class="layer visible"><div class="content"></div></section><section id="b" class="layer"><div class="content"></div></section></main>
 <script>
 (function(root,factory){"use strict";if(typeof define==="function"&&define.amd){define([],factory)}else if(typeof exports==="object"){module.exports=factory()}else{root.textFit=factory()}})(typeof global==="object"?global:this,function(){"use strict";var defaultSettings={alignVert:false,alignHoriz:false,multiLine:false,detectMultiLine:true,minFontSize:6,maxFontSize:80,reProcess:true,widthOnly:false,alignVertWithFlexbox:false};return function textFit(els,options){if(!options)options={};var settings={};for(var key in defaultSettings){if(options.hasOwnProperty(key)){settings[key]=options[key]}else{settings[key]=defaultSettings[key]}}if(typeof els.toArray==="function"){els=els.toArray()}var elType=Object.prototype.toString.call(els);if(elType!=="[object Array]"&&elType!=="[object NodeList]"&&elType!=="[object HTMLCollection]"){els=[els]}for(var i=0;i<els.length;i++){processItem(els[i],settings)}};function processItem(el,settings){if(!isElement(el)||!settings.reProcess&&el.getAttribute("textFitted")){return false}if(!settings.reProcess){el.setAttribute("textFitted",1)}var innerSpan,originalHeight,originalHTML,originalWidth;var low,mid,high;originalHTML=el.innerHTML;originalWidth=innerWidth(el);originalHeight=innerHeight(el);if(!originalWidth||!settings.widthOnly&&!originalHeight){if(!settings.widthOnly)throw new Error("Set a static height and width on the target element "+el.outerHTML+" before using textFit!");else throw new Error("Set a static width on the target element "+el.outerHTML+" before using textFit!")}if(originalHTML.indexOf("textFitted")===-1){innerSpan=document.createElement("span");innerSpan.className="textFitted";innerSpan.style["display"]="inline-block";innerSpan.innerHTML=originalHTML;el.innerHTML="";el.appendChild(innerSpan)}else{innerSpan=el.querySelector("span.textFitted");if(hasClass(innerSpan,"textFitAlignVert")){innerSpan.className=innerSpan.className.replace("textFitAlignVert","");innerSpan.style["height"]="";el.className.replace("textFitAlignVertFlex","")}}if(settings.alignHoriz){el.style["text-align"]="center";innerSpan.style["text-align"]="center"}var multiLine=settings.multiLine;if(settings.detectMultiLine&&!multiLine&&innerSpan.scrollHeight>=parseInt(window.getComputedStyle(innerSpan)["font-size"],10)*2){multiLine=true}if(!multiLine){el.style["white-space"]="nowrap"}low=settings.minFontSize;high=settings.maxFontSize;var size=low;while(low<=high){mid=high+low>>1;innerSpan.style.fontSize=mid+"px";if(innerSpan.scrollWidth<=originalWidth&&(settings.widthOnly||innerSpan.scrollHeight<=originalHeight)){size=mid;low=mid+1}else{high=mid-1}}if(innerSpan.style.fontSize!=size+"px")innerSpan.style.fontSize=size+"px";if(settings.alignVert){addStyleSheet();var height=innerSpan.scrollHeight;if(window.getComputedStyle(el)["position"]==="static"){el.style["position"]="relative"}if(!hasClass(innerSpan,"textFitAlignVert")){innerSpan.className=innerSpan.className+" textFitAlignVert"}innerSpan.style["height"]=height+"px";if(settings.alignVertWithFlexbox&&!hasClass(el,"textFitAlignVertFlex")){el.className=el.className+" textFitAlignVertFlex"}}}function innerHeight(el){var style=window.getComputedStyle(el,null);return el.clientHeight-parseInt(style.getPropertyValue("padding-top"),10)-parseInt(style.getPropertyValue("padding-bottom"),10)}function innerWidth(el){var style=window.getComputedStyle(el,null);return el.clientWidth-parseInt(style.getPropertyValue("padding-left"),10)-parseInt(style.getPropertyValue("padding-right"),10)}function isElement(o){return typeof HTMLElement==="object"?o instanceof HTMLElement:o&&typeof o==="object"&&o!==null&&o.nodeType===1&&typeof o.nodeName==="string"}function hasClass(element,cls){return(" "+element.className+" ").indexOf(" "+cls+" ")>-1}function addStyleSheet(){if(document.getElementById("textFitStyleSheet"))return;var style=[".textFitAlignVert{","position: absolute;","top: 0; right: 0; bottom: 0; left: 0;","margin: auto;","display: flex;","justify-content: center;","flex-direction: column;","}",".textFitAlignVertFlex{","display: flex;","}",".textFitAlignVertFlex .textFitAlignVert{","position: static;","}"].join("");var css=document.createElement("style");css.type="text/css";css.id="textFitStyleSheet";css.innerHTML=style;document.body.appendChild(css)}});
@@ -649,9 +665,9 @@ const layers=[document.getElementById("a"),document.getElementById("b")];let act
 function color(hex,op){const h=String(hex||"#000").replace("#","").padEnd(6,"0").slice(0,6),v=parseInt(h,16);return `rgba(${(v>>16)&255},${(v>>8)&255},${v&255},${Math.max(0,Math.min(100,Number(op||0)))/100})`}
 function hAlign(v){return v==="left"?"flex-start":v==="right"?"flex-end":"center"}function vAlign(v){return v==="top"?"flex-start":v==="bottom"?"flex-end":"center"}function scaling(){return style.scaling==="shrink_to_fit"?"shrink_to_fit":"none"}function maxFontSize(){return Math.max(6,Number(style.font_size||72))}
 function applyCustomCss(css){let el=document.getElementById("custom-css");if(!el){el=document.createElement("style");el.id="custom-css";document.body.appendChild(el)}el.textContent=css||""}
-function applyStyle(s){style=s||{};const r=document.documentElement.style;r.setProperty("--text-color",style.text_color||"#fff");r.setProperty("--text-opacity",Math.max(0,Math.min(100,Number(style.text_opacity??100)))/100);r.setProperty("--font-family",JSON.stringify(style.font_family||"Arial"));r.setProperty("--font-size",`${maxFontSize()}px`);r.setProperty("--font-weight",style.font_weight||"700");r.setProperty("--font-style",style.font_style||"normal");r.setProperty("--letter-spacing",`${Number(style.letter_spacing||0)}px`);r.setProperty("--line-height",Number(style.line_height||1.15));r.setProperty("--text-align",style.text_align||"center");r.setProperty("--content-justify",hAlign(style.text_align));r.setProperty("--content-align",vAlign(style.vertical_align));r.setProperty("--text-transform",style.text_transform||"none");r.setProperty("--layer-padding",`${Number(style.outer_padding_y||0)}px ${Number(style.outer_padding_x||0)}px`);r.setProperty("--crossfade-duration",`${style.crossfade_enabled?Number(style.crossfade_ms||0):0}ms`);r.setProperty("--line-bg-radius",`${Number(style.line_background_radius||0)}px`);r.setProperty("--line-bg-pad-x",`${Number(style.line_background_padding_x||0)}px`);r.setProperty("--line-bg-pad-y",`${Number(style.line_background_padding_y||0)}px`);r.setProperty("--line-bg",style.line_background_enabled?color(style.line_background_color,style.line_background_opacity):"transparent");r.setProperty("--text-shadow",style.shadow_enabled?`${Number(style.shadow_x||0)}px ${Number(style.shadow_y||0)}px ${Number(style.shadow_blur||0)}px ${color(style.shadow_color,style.shadow_opacity)}`:"none");applyCustomCss(style.custom_css||"");requestAnimationFrame(fitAll)}
-function line(t){const s=document.createElement("span");s.className="line";s.textContent=t||"\u00a0";return s}
-function setText(layer,text){const c=layer.querySelector(".content");c.replaceChildren();let lines=String(text||"").replace(/\r\n?/g,"\n").split("\n"),max=Number(style.max_lines||0),needsBreaks=scaling()==="shrink_to_fit";if(max>0&&lines.length>max){lines=lines.slice(0,max);lines[max-1]+="..."}lines.forEach((x,i)=>{if(i&&needsBreaks)c.appendChild(document.createElement("br"));c.appendChild(line(x))});fit(layer)}
+function applyStyle(s){style=s||{};document.documentElement.classList.toggle("hide-empty-lines",!!style.line_background_hide_when_empty);const gap=Math.max(0,Math.min(1000,Number(style.line_gap)||0));document.documentElement.classList.toggle("has-line-gap",gap>0);const r=document.documentElement.style;r.setProperty("--line-gap",`${gap}px`);r.setProperty("--text-color",style.text_color||"#fff");r.setProperty("--text-opacity",Math.max(0,Math.min(100,Number(style.text_opacity??100)))/100);r.setProperty("--font-family",JSON.stringify(style.font_family||"Arial"));r.setProperty("--font-size",`${maxFontSize()}px`);r.setProperty("--font-weight",style.font_weight||"700");r.setProperty("--font-style",style.font_style||"normal");r.setProperty("--letter-spacing",`${Number(style.letter_spacing||0)}px`);r.setProperty("--line-height",Number(style.line_height||1.15));r.setProperty("--text-align",style.text_align||"center");r.setProperty("--content-justify",hAlign(style.text_align));r.setProperty("--content-align",vAlign(style.vertical_align));r.setProperty("--text-transform",style.text_transform||"none");r.setProperty("--layer-padding",`${Number(style.outer_padding_y||0)}px ${Number(style.outer_padding_x||0)}px`);r.setProperty("--crossfade-duration",`${style.crossfade_enabled?Number(style.crossfade_ms||0):0}ms`);r.setProperty("--line-bg-radius",`${Number(style.line_background_radius||0)}px`);r.setProperty("--line-bg-pad-x",`${Number(style.line_background_padding_x||0)}px`);r.setProperty("--line-bg-pad-y",`${Number(style.line_background_padding_y||0)}px`);r.setProperty("--line-bg",style.line_background_enabled?color(style.line_background_color,style.line_background_opacity):"transparent");r.setProperty("--text-shadow",style.shadow_enabled?`${Number(style.shadow_x||0)}px ${Number(style.shadow_y||0)}px ${Number(style.shadow_blur||0)}px ${color(style.shadow_color,style.shadow_opacity)}`:"none");applyCustomCss(style.custom_css||"");requestAnimationFrame(fitAll)}
+function line(t){const s=document.createElement("span");s.className="line";s.classList.toggle("empty-line",!String(t).trim());s.textContent=t||"\u00a0";return s}
+function setText(layer,text){const c=layer.querySelector(".content");c.replaceChildren();let lines=String(text||"").replace(/\r\n?/g,"\n").split("\n"),max=Number(style.max_lines||0),needsBreaks=scaling()==="shrink_to_fit";if(max>0&&lines.length>max){lines=lines.slice(0,max);lines[max-1]+="..."}let hasContent=false;lines.forEach((x,i)=>{const empty=!x.trim();if(i&&needsBreaks){const br=document.createElement("br");br.classList.toggle("empty-line",empty||!hasContent);c.appendChild(br)}c.appendChild(line(x));if(!empty)hasContent=true});fit(layer)}
 function showText(text){if(text===lastText)return;lastText=text;const next=active?0:1;setText(layers[next],text);layers[next].classList.add("visible");layers[active].classList.remove("visible");active=next}
 function fit(layer){const c=layer.querySelector(".content");const shrink=scaling()==="shrink_to_fit";c.classList.toggle("shrink-to-fit",shrink);c.classList.toggle("no-wrap",!!style.disable_line_wrapping);c.style.fontSize=`${maxFontSize()}px`;if(!shrink)return;requestAnimationFrame(()=>{try{textFit(c,{alignVert:false,alignHoriz:false,multiLine:true,detectMultiLine:false,minFontSize:6,maxFontSize:maxFontSize(),reProcess:true,widthOnly:false})}catch(e){}})}
 function fitAll(){for(const l of layers)fit(l)}async function poll(){try{const res=await fetch(`/state?t=${Date.now()}`,{cache:"no-store"}),st=await res.json(),ss=JSON.stringify(st.style||{});if(ss!==lastStyle){lastStyle=ss;applyStyle(st.style||{});setText(layers[active],lastText||st.text||"")}if(st.revision!==lastRev){lastRev=st.revision;showText(st.text||"")}}catch(e){}setTimeout(poll,120)}window.addEventListener("resize",fitAll);poll();
@@ -762,23 +778,31 @@ public:
 	using LogCallback = std::function<void(const std::string &)>;
 	~StageDisplayClient() { stop(); }
 
+	// OBS only publishes settings here; it never joins a connecting worker.
 	void start(Settings settings, TextCallback callback, LogCallback log_callback)
 	{
-		stop();
-		settings_ = std::move(settings);
-		callback_ = std::move(callback);
-		log_callback_ = std::move(log_callback);
-		stopped_ = false;
-		thread_ = std::thread([this] { run(); });
+		std::lock_guard<std::mutex> lock(control_mutex_);
+		pending_settings_ = std::move(settings);
+		pending_callback_ = std::move(callback);
+		pending_log_callback_ = std::move(log_callback);
+		pending_ = true;
+		stopped_ = true;
+		if (!thread_.joinable()) {
+			quitting_ = false;
+			thread_ = std::thread([this] { worker(); });
+		}
+		control_changed_.notify_all();
 	}
 
 	void stop()
 	{
-		stopped_ = true;
-		close_socket(socket_);
-		socket_ = invalid_socket_handle;
-		if (thread_.joinable())
-			thread_.join();
+		{
+			std::lock_guard<std::mutex> lock(control_mutex_);
+			quitting_ = true;
+			stopped_ = true;
+		}
+		control_changed_.notify_all();
+		if (thread_.joinable()) thread_.join();
 	}
 
 private:
@@ -788,30 +812,128 @@ private:
 			log_callback_(message);
 	}
 
+	using Clock = std::chrono::steady_clock;
+
+	void pause(std::chrono::milliseconds duration)
+	{
+		std::unique_lock<std::mutex> lock(control_mutex_);
+		control_changed_.wait_for(lock, duration, [this] { return stopped_.load(); });
+	}
+
+	void worker()
+	{
+		for (;;) {
+			{
+				std::unique_lock<std::mutex> lock(control_mutex_);
+				control_changed_.wait(lock, [this] { return quitting_ || pending_; });
+				if (quitting_) return;
+				settings_ = std::move(pending_settings_);
+				callback_ = std::move(pending_callback_);
+				log_callback_ = std::move(pending_log_callback_);
+				pending_ = false;
+				stopped_ = false;
+			}
+			run();
+			// Only this thread owns and closes the network sockets.
+			close_socket(socket_);
+			socket_ = invalid_socket_handle;
+		}
+	}
+
+	bool wait_socket(socket_handle socket, bool writing, Clock::time_point deadline)
+	{
+#ifndef _WIN32
+		if (socket < 0 || socket >= FD_SETSIZE) return false;
+#endif
+		while (!stopped_ && Clock::now() < deadline) {
+			fd_set ready;
+			FD_ZERO(&ready);
+			FD_SET(socket, &ready);
+			timeval timeout{0, 50000};
+			int result = select(static_cast<int>(socket + 1), writing ? nullptr : &ready,
+				writing ? &ready : nullptr, nullptr, &timeout);
+			if (result > 0) return !stopped_;
+			if (result < 0) return false;
+		}
+		return false;
+	}
+
+	static bool would_block()
+	{
+#ifdef _WIN32
+		int error = WSAGetLastError();
+		return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS || error == WSAEINTR;
+#else
+		return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS || errno == EINTR;
+#endif
+	}
+
+	int receive(socket_handle socket, char *data, size_t size, Clock::time_point deadline = Clock::time_point::max())
+	{
+		while (wait_socket(socket, false, deadline)) {
+			int result = recv(socket, data, static_cast<int>(size), 0);
+			if (result >= 0 || !would_block()) return result;
+		}
+		return -1;
+	}
+
+	bool send_all(socket_handle socket, const char *data, size_t size)
+	{
+		auto deadline = Clock::now() + std::chrono::seconds(2);
+		while (size && wait_socket(socket, true, deadline)) {
+#ifdef MSG_NOSIGNAL
+			int sent = send(socket, data, static_cast<int>(size), MSG_NOSIGNAL);
+#else
+			int sent = send(socket, data, static_cast<int>(size), 0);
+#endif
+			if (sent < 0 && would_block()) continue;
+			if (sent <= 0) return false;
+			data += sent;
+			size -= static_cast<size_t>(sent);
+		}
+		return size == 0;
+	}
+
 	socket_handle connect_tcp(const std::string &host, int port)
 	{
 		socket_startup();
-		addrinfo hints = {};
-		hints.ai_family = AF_UNSPEC;
-		hints.ai_socktype = SOCK_STREAM;
-		addrinfo *result = nullptr;
-		std::string port_string = std::to_string(port);
-		if (getaddrinfo(host.c_str(), port_string.c_str(), &hints, &result) != 0)
-			return invalid_socket_handle;
+		auto addresses = stage_discovery::addresses(host, port, stopped_);
 		socket_handle out = invalid_socket_handle;
-		for (addrinfo *ptr = result; ptr; ptr = ptr->ai_next) {
-			out = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
-			if (out == invalid_socket_handle)
-				continue;
-			if (connect(out, ptr->ai_addr, static_cast<int>(ptr->ai_addrlen)) == 0)
-				break;
+		for (const auto &address : addresses) {
+			if (stopped_) break;
+			out = socket(address.ss_family, SOCK_STREAM, IPPROTO_TCP);
+			if (out == invalid_socket_handle) continue;
+#ifdef _WIN32
+			u_long nonblocking = 1;
+			bool configured = ioctlsocket(out, FIONBIO, &nonblocking) == 0;
+#else
+			int flags = fcntl(out, F_GETFL, 0);
+			bool configured = flags >= 0 && fcntl(out, F_SETFL, flags | O_NONBLOCK) == 0;
+#ifdef SO_NOSIGPIPE
+			int yes = 1;
+			setsockopt(out, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+#endif
+#endif
+			int length = address.ss_family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
+			if (configured) {
+				int result = connect(out, reinterpret_cast<const sockaddr *>(&address), length);
+				if (result == 0) return out;
+				if (would_block() && wait_socket(out, true, Clock::now() + std::chrono::seconds(2))) {
+					int error = 0;
+#ifdef _WIN32
+					int error_size = sizeof(error);
+#else
+					socklen_t error_size = sizeof(error);
+#endif
+					if (getsockopt(out, SOL_SOCKET, SO_ERROR, reinterpret_cast<char *>(&error), &error_size) == 0 && !error)
+						return out;
+				}
+			}
 			close_socket(out);
 			out = invalid_socket_handle;
 		}
-		freeaddrinfo(result);
-		if (out == invalid_socket_handle)
-			log("TCP connection failed to " + host + ":" + std::to_string(port));
-		return out;
+		if (!stopped_) log("TCP connection failed to " + host + ":" + std::to_string(port));
+		return invalid_socket_handle;
 	}
 
 	bool read_exact(socket_handle socket, void *data, size_t bytes)
@@ -819,7 +941,7 @@ private:
 		char *cursor = static_cast<char *>(data);
 		size_t done = 0;
 		while (done < bytes && !stopped_) {
-			int got = recv(socket, cursor + done, static_cast<int>(bytes - done), 0);
+			int got = receive(socket, cursor + done, bytes - done);
 			if (got <= 0)
 				return false;
 			done += static_cast<size_t>(got);
@@ -841,12 +963,13 @@ private:
 		request << "Sec-WebSocket-Key: " << key << "\r\n";
 		request << "Sec-WebSocket-Version: 13\r\n\r\n";
 		std::string raw = request.str();
-		send(socket_, raw.data(), static_cast<int>(raw.size()), 0);
+		if (!send_all(socket_, raw.data(), raw.size())) return false;
+		auto deadline = Clock::now() + std::chrono::seconds(3);
 
 		std::string response;
 		char ch = 0;
 		while (response.find("\r\n\r\n") == std::string::npos && response.size() < 65536) {
-			if (recv(socket_, &ch, 1, 0) != 1)
+			if (receive(socket_, &ch, 1, deadline) != 1)
 				return false;
 			response.push_back(ch);
 		}
@@ -875,7 +998,7 @@ private:
 		frame.insert(frame.end(), mask, mask + 4);
 		for (size_t i = 0; i < payload.size(); ++i)
 			frame.push_back(static_cast<uint8_t>(payload[i]) ^ mask[i % 4]);
-		send(socket_, reinterpret_cast<const char *>(frame.data()), static_cast<int>(frame.size()), 0);
+		send_all(socket_, reinterpret_cast<const char *>(frame.data()), frame.size());
 	}
 
 	void send_ws_text(const std::string &payload)
@@ -955,13 +1078,18 @@ private:
 		request << "GET /v1/status/slide HTTP/1.1\r\nHost: " << settings_.host << ":" << settings_.port
 			<< "\r\nAccept: application/json\r\nConnection: close\r\n\r\n";
 		std::string raw = request.str();
-		send(socket, raw.data(), static_cast<int>(raw.size()), 0);
+		if (!send_all(socket, raw.data(), raw.size())) {
+			close_socket(socket);
+			return "";
+		}
+		auto deadline = Clock::now() + std::chrono::seconds(3);
 		std::string response;
 		char buffer[4096];
 		int got = 0;
-		while ((got = recv(socket, buffer, sizeof(buffer), 0)) > 0)
+		while (response.size() < 1024 * 1024 && (got = receive(socket, buffer, sizeof(buffer), deadline)) > 0)
 			response.append(buffer, static_cast<size_t>(got));
 		close_socket(socket);
+		if (got < 0 || stopped_ || response.size() >= 1024 * 1024) return "";
 		size_t split = response.find("\r\n\r\n");
 		return split == std::string::npos ? response : response.substr(split + 4);
 	}
@@ -974,7 +1102,7 @@ private:
 			std::string text = extract_http_text(body, settings_.channel);
 			if (!text.empty())
 				callback_(text);
-			std::this_thread::sleep_for(std::chrono::milliseconds(std::max(150, settings_.poll_interval_ms)));
+			pause(std::chrono::milliseconds(std::max(150, settings_.poll_interval_ms)));
 		}
 	}
 
@@ -994,8 +1122,11 @@ private:
 	void run_stage_session()
 	{
 		log("Connecting to ProPresenter Stage Display at " + settings_.host + ":" + std::to_string(settings_.port));
-		if (!websocket_handshake())
+		if (!websocket_handshake()) {
+			close_socket(socket_);
+			socket_ = invalid_socket_handle;
 			return;
+		}
 		send_ws_text("{\"acn\":\"ath\",\"ptl\":610,\"pwd\":\"" + escape_json(settings_.password) + "\"}");
 		log("Stage Display authentication sent.");
 		std::set<std::string> requested;
@@ -1065,18 +1196,40 @@ private:
 
 	void run()
 	{
+		socket_startup();
 		while (!stopped_) {
+			if (!settings_.service_id.empty()) {
+				stage_discovery::Service service;
+				if (!stage_discovery::parse_id(settings_.service_id, service) ||
+				    !stage_discovery::resolve(service, stopped_)) {
+					log("Waiting for the selected Stage Display instance to appear.");
+					for (int i = 0; i < 30 && !stopped_; ++i)
+						pause(std::chrono::milliseconds(100));
+					continue;
+				}
+				settings_.host = service.host;
+				settings_.port = service.port;
+				log("Resolved " + service.name + " at " + service.host + ":" + std::to_string(service.port));
+			}
+			if (stopped_) break;
 			if (settings_.api_mode == "http_status_poll") {
-				run_http_poll_for(std::chrono::hours(24));
+				run_http_poll_for(settings_.service_id.empty() ? std::chrono::seconds(86400) : std::chrono::seconds(5));
 			} else {
 				run_stage_session();
 				if (settings_.api_mode == "stage_with_http_fallback")
 					run_http_poll_for(std::chrono::seconds(4));
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+			pause(std::chrono::milliseconds(1000));
 		}
 	}
 
+	std::mutex control_mutex_;
+	std::condition_variable control_changed_;
+	bool pending_ = false;
+	bool quitting_ = false;
+	Settings pending_settings_;
+	TextCallback pending_callback_;
+	LogCallback pending_log_callback_;
 	Settings settings_;
 	TextCallback callback_;
 	LogCallback log_callback_;
@@ -1169,6 +1322,8 @@ static std::map<std::string, Style> load_presets()
 			style.shadow_blur = as_int();
 		else if (key == "line_background_enabled")
 			style.line_background_enabled = as_bool();
+		else if (key == "line_background_hide_when_empty")
+			style.line_background_hide_when_empty = as_bool();
 		else if (key == "line_background_color")
 			style.line_background_color = as_color();
 		else if (key == "line_background_opacity")
@@ -1177,6 +1332,8 @@ static std::map<std::string, Style> load_presets()
 			style.line_background_padding_x = as_int();
 		else if (key == "line_background_padding_y")
 			style.line_background_padding_y = as_int();
+		else if (key == "line_gap")
+			style.line_gap = as_int();
 		else if (key == "line_background_radius")
 			style.line_background_radius = as_int();
 		else if (key == "crossfade_enabled")
@@ -1213,10 +1370,12 @@ static void write_style_ini(std::ostream &out, const Style &style)
 	out << "shadow_y=" << style.shadow_y << "\n";
 	out << "shadow_blur=" << style.shadow_blur << "\n";
 	out << "line_background_enabled=" << (style.line_background_enabled ? 1 : 0) << "\n";
+	out << "line_background_hide_when_empty=" << (style.line_background_hide_when_empty ? 1 : 0) << "\n";
 	out << "line_background_color=" << style.line_background_color << "\n";
 	out << "line_background_opacity=" << style.line_background_opacity << "\n";
 	out << "line_background_padding_x=" << style.line_background_padding_x << "\n";
 	out << "line_background_padding_y=" << style.line_background_padding_y << "\n";
+	out << "line_gap=" << style.line_gap << "\n";
 	out << "line_background_radius=" << style.line_background_radius << "\n";
 	out << "crossfade_enabled=" << (style.crossfade_enabled ? 1 : 0) << "\n";
 	out << "crossfade_ms=" << style.crossfade_ms << "\n";
@@ -1251,17 +1410,85 @@ struct ProPresenterLyricsSource {
 	LogStore logs;
 	OverlayServer server;
 	StageDisplayClient client;
+	std::mutex discovery_mutex;
+	std::vector<stage_discovery::Service> discovered;
+	std::atomic<bool> discovery_cancel{false};
+	std::atomic<bool> scanning{false};
+	std::thread discovery_thread;
+	std::thread log_updates_thread;
+	std::mutex log_updates_mutex;
+	std::condition_variable log_updates_changed;
+	bool log_updates_stopped = false;
 
 	explicit ProPresenterLyricsSource(obs_source_t *source_) : source(source_), server(state) {}
 };
 
+// No network or render thread waits for a properties refresh. Changes are
+// coalesced, and no refresh is emitted while the in-memory log is unchanged.
+static void start_log_updates(ProPresenterLyricsSource *ctx)
+{
+	ctx->log_updates_thread = std::thread([ctx] {
+		uint64_t published = 0;
+		std::unique_lock<std::mutex> lock(ctx->log_updates_mutex);
+		while (!ctx->log_updates_changed.wait_for(lock, std::chrono::milliseconds(500),
+			[ctx] { return ctx->log_updates_stopped; })) {
+			uint64_t revision = ctx->logs.revision();
+			if (revision == published) continue;
+			published = revision;
+			lock.unlock();
+			obs_source_update_properties(ctx->source);
+			lock.lock();
+		}
+	});
+}
+
+static void stop_log_updates(ProPresenterLyricsSource *ctx)
+{
+	{
+		std::lock_guard<std::mutex> lock(ctx->log_updates_mutex);
+		ctx->log_updates_stopped = true;
+	}
+	ctx->log_updates_changed.notify_all();
+	if (ctx->log_updates_thread.joinable()) ctx->log_updates_thread.join();
+}
+
+static std::string log_display_html(const std::string &text)
+{
+	// OBS info labels interpret rich text. Escape messages, including lyrics,
+	// so text from ProPresenter cannot become markup or clickable links.
+	std::string html = "<span style=\"font-family:monospace\">";
+	for (char ch : text) {
+		switch (ch) {
+		case '&': html += "&amp;"; break;
+		case '<': html += "&lt;"; break;
+		case '>': html += "&gt;"; break;
+		case '\n': html += "<br/>"; break;
+		default: html += ch; break;
+		}
+	}
+	return html + "</span>";
+}
+
+static void start_discovery(ProPresenterLyricsSource *ctx)
+{
+	if (ctx->scanning.exchange(true)) return;
+	if (ctx->discovery_thread.joinable()) ctx->discovery_thread.join();
+	ctx->discovery_thread = std::thread([ctx] {
+		socket_startup();
+		auto results = stage_discovery::scan(ctx->discovery_cancel);
+		{
+			std::lock_guard<std::mutex> lock(ctx->discovery_mutex);
+			ctx->discovered = std::move(results);
+		}
+		ctx->scanning = false;
+		if (!ctx->discovery_cancel) obs_source_update_properties(ctx->source);
+	});
+}
+
 static void read_settings(obs_data_t *data, Settings &settings)
 {
-	std::string previous_tab = settings.settings_tab.empty() ? "connection" : settings.settings_tab;
-	settings.settings_tab = obs_data_get_string(data, "settings_tab");
-	if (settings.settings_tab.empty())
-		settings.settings_tab = previous_tab;
 	settings.host = obs_data_get_string(data, "prop_host");
+	settings.service_id = obs_data_get_string(data, "prop_service");
 	settings.port = static_cast<int>(obs_data_get_int(data, "prop_port"));
 	settings.password = obs_data_get_string(data, "prop_password");
 	settings.api_mode = obs_data_get_string(data, "api_mode");
@@ -1300,10 +1527,12 @@ static void read_settings(obs_data_t *data, Settings &settings)
 	s.shadow_y = static_cast<int>(obs_data_get_int(data, "shadow_y"));
 	s.shadow_blur = static_cast<int>(obs_data_get_int(data, "shadow_blur"));
 	s.line_background_enabled = obs_data_get_bool(data, "line_background_enabled");
+	s.line_background_hide_when_empty = obs_data_get_bool(data, "line_background_hide_when_empty");
 	s.line_background_color = static_cast<uint32_t>(obs_data_get_int(data, "line_background_color"));
 	s.line_background_opacity = static_cast<int>(obs_data_get_int(data, "line_background_opacity"));
 	s.line_background_padding_x = static_cast<int>(obs_data_get_int(data, "line_background_padding_x"));
 	s.line_background_padding_y = static_cast<int>(obs_data_get_int(data, "line_background_padding_y"));
+	s.line_gap = static_cast<int>(obs_data_get_int(data, "line_gap"));
 	s.line_background_radius = static_cast<int>(obs_data_get_int(data, "line_background_radius"));
 	s.crossfade_enabled = obs_data_get_bool(data, "crossfade_enabled");
 	s.crossfade_ms = static_cast<int>(obs_data_get_int(data, "crossfade_ms"));
@@ -1350,6 +1579,8 @@ static void *source_create(obs_data_t *settings, obs_source_t *source)
 					  ctx->logs.add("Slide text updated: " + preview_text(text));
 			  },
 			  [ctx](const std::string &message) { ctx->logs.add(message); });
+	start_discovery(ctx);
+	start_log_updates(ctx);
 	return ctx;
 }
 
@@ -1358,6 +1589,9 @@ static void source_destroy(void *data)
 	auto *ctx = static_cast<ProPresenterLyricsSource *>(data);
 	if (!ctx)
 		return;
+	stop_log_updates(ctx);
+	ctx->discovery_cancel = true;
+	if (ctx->discovery_thread.joinable()) ctx->discovery_thread.join();
 	ctx->client.stop();
 	ctx->server.stop();
 	if (ctx->browser) {
@@ -1385,11 +1619,10 @@ static void source_update(void *data, obs_data_t *settings)
 		ctx->server.start(ctx->settings.overlay_port);
 		update_browser(ctx);
 	}
-	if (previous.host != ctx->settings.host || previous.port != ctx->settings.port ||
+	if (previous.service_id != ctx->settings.service_id || previous.host != ctx->settings.host || previous.port != ctx->settings.port ||
 	    previous.password != ctx->settings.password || previous.api_mode != ctx->settings.api_mode ||
 	    previous.channel != ctx->settings.channel || previous.poll_interval_ms != ctx->settings.poll_interval_ms) {
 		ctx->logs.add("Connection settings changed. Reconnecting to ProPresenter.");
-		ctx->client.stop();
 		ctx->client.start(ctx->settings,
 				  [ctx](const std::string &text) {
 					  if (ctx->state.setText(text))
@@ -1518,12 +1751,53 @@ static bool delete_preset(obs_properties_t *, obs_property_t *, void *data)
 	return true;
 }
 
+static bool scan_displays(obs_properties_t *, obs_property_t *, void *data)
+{
+	auto *ctx = static_cast<ProPresenterLyricsSource *>(data);
+	if (ctx) start_discovery(ctx);
+	return true;
+}
+
+static bool display_selection_changed(obs_properties_t *props, obs_property_t *, obs_data_t *settings)
+{
+	bool manual = std::string(obs_data_get_string(settings, "prop_service")).empty();
+	obs_property_set_enabled(obs_properties_get(props, "prop_host"), manual);
+	obs_property_set_enabled(obs_properties_get(props, "prop_port"), manual);
+	return true;
+}
+
 static obs_properties_t *source_properties(void *data)
 {
 	auto *ctx = static_cast<ProPresenterLyricsSource *>(data);
 	obs_properties_t *props = obs_properties_create();
 
+	// Consecutive sibling tab groups form one native tab bar. OBS owns the
+	// selection state and preserves it by group name across property refreshes.
 	obs_properties_t *connection = obs_properties_create();
+	auto *displays = obs_properties_add_list(connection, "prop_service", obs_module_text("StageDisplayInstance"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(displays, obs_module_text("ManualConnection"), "");
+	if (ctx) {
+		std::lock_guard<std::mutex> lock(ctx->discovery_mutex);
+		bool selected_found = ctx->settings.service_id.empty();
+		for (const auto &service : ctx->discovered) {
+			std::string label = service.name + " (" + service.host + ":" + std::to_string(service.port) + ")";
+			obs_property_list_add_string(displays, label.c_str(), service.id().c_str());
+			if (service.id() == ctx->settings.service_id) selected_found = true;
+		}
+		if (!selected_found) {
+			stage_discovery::Service saved;
+			stage_discovery::parse_id(ctx->settings.service_id, saved);
+			std::string label = saved.name + " — " + obs_module_text("DisplayUnavailable");
+			obs_property_list_add_string(displays, label.c_str(), ctx->settings.service_id.c_str());
+		}
+	}
+	obs_property_set_modified_callback(displays, display_selection_changed);
+	auto *scan = obs_properties_add_button(connection, "scan_displays",
+		obs_module_text(ctx && ctx->scanning ? "ScanningDisplays" : "ScanDisplays"), scan_displays);
+	obs_property_set_enabled(scan, ctx && !ctx->scanning && stage_discovery::available());
+	obs_properties_add_text(connection, "discovery_help",
+		obs_module_text(stage_discovery::available() ? "DiscoveryHelp" : "DiscoveryUnavailable"), OBS_TEXT_INFO);
 	obs_properties_add_text(connection, "prop_host", obs_module_text("ProPresenterIPAddress"), OBS_TEXT_DEFAULT);
 	obs_properties_add_int(connection, "prop_port", obs_module_text("ProPresenterPort"), 1, 65535, 1);
 	obs_properties_add_text(connection, "prop_password", obs_module_text("ProPresenterPassword"), OBS_TEXT_PASSWORD);
@@ -1539,12 +1813,20 @@ static obs_properties_t *source_properties(void *data)
 			 {obs_module_text("StageMessage"), "msg"}});
 	obs_properties_add_int(connection, "poll_interval_ms", obs_module_text("HTTPPollInterval"), 150, 5000, 50);
 	obs_properties_add_int(connection, "overlay_port", obs_module_text("OverlayPort"), 1024, 65535, 1);
-	obs_properties_add_group(props, "connection", obs_module_text("Connection"), OBS_GROUP_NORMAL, connection);
+	obs_properties_t *log = obs_properties_create();
+	std::string log_text = ctx ? ctx->logs.text() : "Create the source to see live connection messages.";
+	std::string log_html = log_display_html(log_text);
+	auto *live_log = obs_properties_add_text(log, "live_connection_log", log_html.c_str(), OBS_TEXT_INFO);
+	obs_property_text_set_info_word_wrap(live_log, true);
+	obs_properties_add_button(log, "open_log_file", obs_module_text("OpenLogFile"), open_log_file);
+	obs_properties_add_button(log, "open_log_folder", obs_module_text("OpenLogFolder"), open_log_folder);
+	obs_properties_add_group(connection, "log", obs_module_text("LiveConnectionLog"), OBS_GROUP_NORMAL, log);
+	obs_properties_add_group(props, "connection", obs_module_text("Connection"), OBS_GROUP_TAB, connection);
 
 	obs_properties_t *size = obs_properties_create();
 	obs_properties_add_int(size, "width", obs_module_text("Width"), 160, 7680, 10);
 	obs_properties_add_int(size, "height", obs_module_text("Height"), 90, 4320, 10);
-	obs_properties_add_group(props, "size", obs_module_text("Size"), OBS_GROUP_NORMAL, size);
+	obs_properties_add_group(props, "size", obs_module_text("Size"), OBS_GROUP_TAB, size);
 
 	obs_properties_t *presets = obs_properties_create();
 	obs_properties_add_text(presets, "preset_name", obs_module_text("PresetName"), OBS_TEXT_DEFAULT);
@@ -1556,7 +1838,7 @@ static obs_properties_t *source_properties(void *data)
 	obs_properties_add_button(presets, "save_preset", obs_module_text("SavePreset"), save_preset);
 	obs_properties_add_button(presets, "apply_preset", obs_module_text("ApplyPreset"), apply_preset);
 	obs_properties_add_button(presets, "delete_preset", obs_module_text("DeletePreset"), delete_preset);
-	obs_properties_add_group(props, "presets", obs_module_text("Presets"), OBS_GROUP_NORMAL, presets);
+	obs_properties_add_group(props, "presets", obs_module_text("Presets"), OBS_GROUP_TAB, presets);
 
 	obs_properties_t *typography = obs_properties_create();
 	obs_properties_add_color(typography, "text_color", obs_module_text("TextColor"));
@@ -1582,7 +1864,7 @@ static obs_properties_t *source_properties(void *data)
 			{{"Shrink to fit", "shrink_to_fit"}, {"None", "none"}});
 	obs_properties_add_int_slider(typography, "outer_padding_x", obs_module_text("HorizontalPadding"), 0, 1000, 1);
 	obs_properties_add_int_slider(typography, "outer_padding_y", obs_module_text("VerticalPadding"), 0, 1000, 1);
-	obs_properties_add_group(props, "typography", obs_module_text("Typography"), OBS_GROUP_NORMAL, typography);
+	obs_properties_add_group(props, "typography", obs_module_text("Typography"), OBS_GROUP_TAB, typography);
 
 	obs_properties_t *shadow = obs_properties_create();
 	obs_properties_add_bool(shadow, "shadow_enabled", obs_module_text("TextShadow"));
@@ -1591,21 +1873,24 @@ static obs_properties_t *source_properties(void *data)
 	obs_properties_add_int_slider(shadow, "shadow_x", obs_module_text("ShadowX"), -100, 100, 1);
 	obs_properties_add_int_slider(shadow, "shadow_y", obs_module_text("ShadowY"), -100, 100, 1);
 	obs_properties_add_int_slider(shadow, "shadow_blur", obs_module_text("ShadowBlur"), 0, 200, 1);
-	obs_properties_add_group(props, "shadow", obs_module_text("Shadow"), OBS_GROUP_NORMAL, shadow);
+	obs_properties_add_group(props, "shadow", obs_module_text("Shadow"), OBS_GROUP_TAB, shadow);
 
 	obs_properties_t *line_background = obs_properties_create();
 	obs_properties_add_bool(line_background, "line_background_enabled", obs_module_text("LineBackground"));
+	obs_properties_add_bool(line_background, "line_background_hide_when_empty", obs_module_text("HideWhenEmpty"));
+	obs_property_t *line_gap = obs_properties_add_int_slider(line_background, "line_gap", obs_module_text("LineGap"), 0, 1000, 1);
+	obs_property_int_set_suffix(line_gap, " px");
 	obs_properties_add_color(line_background, "line_background_color", obs_module_text("LineBackgroundColor"));
 	obs_properties_add_int_slider(line_background, "line_background_opacity", obs_module_text("LineBackgroundOpacity"), 0, 100, 1);
 	obs_properties_add_int_slider(line_background, "line_background_padding_x", obs_module_text("LineBackgroundPaddingX"), 0, 200, 1);
 	obs_properties_add_int_slider(line_background, "line_background_padding_y", obs_module_text("LineBackgroundPaddingY"), 0, 100, 1);
 	obs_properties_add_int_slider(line_background, "line_background_radius", obs_module_text("LineBackgroundRadius"), 0, 80, 1);
-	obs_properties_add_group(props, "line_background", obs_module_text("LineBackground"), OBS_GROUP_NORMAL, line_background);
+	obs_properties_add_group(props, "line_background", obs_module_text("LineBackground"), OBS_GROUP_TAB, line_background);
 
 	obs_properties_t *transitions = obs_properties_create();
 	obs_properties_add_bool(transitions, "crossfade_enabled", obs_module_text("Crossfade"));
 	obs_properties_add_int_slider(transitions, "crossfade_ms", obs_module_text("CrossfadeDuration"), 0, 5000, 25);
-	obs_properties_add_group(props, "transitions", obs_module_text("Transitions"), OBS_GROUP_NORMAL, transitions);
+	obs_properties_add_group(props, "transitions", obs_module_text("Transitions"), OBS_GROUP_TAB, transitions);
 
 	obs_properties_t *custom_css = obs_properties_create();
 	obs_property_t *css_help =
@@ -1615,21 +1900,8 @@ static obs_properties_t *source_properties(void *data)
 		obs_properties_add_text(custom_css, "custom_css", obs_module_text("CustomCSS"), OBS_TEXT_MULTILINE);
 	obs_property_text_set_monospace(css_text, true);
 	obs_properties_add_button(custom_css, "open_overlay_browser", obs_module_text("OpenOverlayBrowser"), open_overlay_browser);
-	obs_properties_add_group(props, "custom_css_group", obs_module_text("CustomCSSTab"), OBS_GROUP_NORMAL, custom_css);
+	obs_properties_add_group(props, "custom_css_group", obs_module_text("CustomCSSTab"), OBS_GROUP_TAB, custom_css);
 
-	obs_properties_t *log = obs_properties_create();
-	std::string log_text = ctx ? ctx->logs.text() : "Create the source, then reopen properties to see connection logs.";
-	obs_property_t *log_preview = obs_properties_add_text(log, "connection_log", obs_module_text("LogPreview"), OBS_TEXT_MULTILINE);
-	obs_property_text_set_monospace(log_preview, true);
-	obs_properties_add_button(log, "open_log_file", obs_module_text("OpenLogFile"), open_log_file);
-	obs_properties_add_button(log, "open_log_folder", obs_module_text("OpenLogFolder"), open_log_folder);
-	obs_properties_add_group(props, "log", obs_module_text("LogTab"), OBS_GROUP_NORMAL, log);
-
-	if (ctx && ctx->source) {
-		obs_data_t *settings = obs_source_get_settings(ctx->source);
-		obs_data_set_string(settings, "connection_log", log_text.c_str());
-		obs_data_release(settings);
-	}
 
 	return props;
 }
@@ -1637,7 +1909,6 @@ static obs_properties_t *source_properties(void *data)
 static void source_defaults(obs_data_t *settings)
 {
 	Style style;
-	obs_data_set_default_string(settings, "settings_tab", "connection");
 	obs_data_set_default_string(settings, "prop_host", "127.0.0.1");
 	obs_data_set_default_int(settings, "prop_port", 50001);
 	obs_data_set_default_string(settings, "prop_password", "");
@@ -1673,10 +1944,12 @@ static void source_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "shadow_y", style.shadow_y);
 	obs_data_set_default_int(settings, "shadow_blur", style.shadow_blur);
 	obs_data_set_default_bool(settings, "line_background_enabled", style.line_background_enabled);
+	obs_data_set_default_bool(settings, "line_background_hide_when_empty", style.line_background_hide_when_empty);
 	obs_data_set_default_int(settings, "line_background_color", style.line_background_color);
 	obs_data_set_default_int(settings, "line_background_opacity", style.line_background_opacity);
 	obs_data_set_default_int(settings, "line_background_padding_x", style.line_background_padding_x);
 	obs_data_set_default_int(settings, "line_background_padding_y", style.line_background_padding_y);
+	obs_data_set_default_int(settings, "line_gap", style.line_gap);
 	obs_data_set_default_int(settings, "line_background_radius", style.line_background_radius);
 	obs_data_set_default_bool(settings, "crossfade_enabled", style.crossfade_enabled);
 	obs_data_set_default_int(settings, "crossfade_ms", style.crossfade_ms);

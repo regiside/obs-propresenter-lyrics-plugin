@@ -1,0 +1,14 @@
+#pragma once
+
+#include <obs-properties.h>
+
+#cmakedefine01 PROPRESENTER_HAS_OBS_GROUP_TAB
+
+#if !PROPRESENTER_HAS_OBS_GROUP_TAB
+// ABI value from the OBS plugin-property-tabs API. Older properties views
+// render this through the existing group API as a normal labeled section.
+// Do not raise the plugin's libobs API version just to obtain this enum.
+static_assert(OBS_GROUP_NORMAL == 1 && OBS_GROUP_CHECKABLE == 2,
+              "Recheck the OBS group ABI before using the tab compatibility value");
+#define OBS_GROUP_TAB static_cast<obs_group_type>(3)
+#endif
