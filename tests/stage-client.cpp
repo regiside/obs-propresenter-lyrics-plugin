@@ -114,8 +114,33 @@ static void check_live_log()
 	std::cout << "Live log memory, revision, history, and escaping checks passed\n";
 }
 
+static void check_refresh_log_button()
+{
+	ProPresenterLyricsSource ctx(nullptr, "");
+	auto *props = obs_properties_create();
+	auto *connection = obs_properties_create();
+	auto *logs = obs_properties_create();
+	auto *label = obs_properties_add_text(logs, "live_connection_log", "stale", OBS_TEXT_INFO);
+	auto *button = obs_properties_add_button2(logs, "refresh_log_display", "Refresh log", refresh_log_display, &ctx);
+	obs_properties_add_group(connection, "log", "Log", OBS_GROUP_NORMAL, logs);
+	obs_properties_add_group(props, "connection", "Connection", OBS_GROUP_TAB, connection);
+	for (int i = 0; i < 100; ++i) {
+		obs_property_set_description(label, "stale");
+		assert(obs_property_button_clicked(button, nullptr));
+		assert(std::string(obs_property_description(label)) == log_display_html(ctx.logs.text()));
+		assert(obs_properties_get(props, "refresh_log_display") == button);
+	}
+	assert(!refresh_log_display(props, button, nullptr));
+	obs_properties_destroy(props);
+	props = obs_properties_create();
+	assert(!refresh_log_display(props, nullptr, &ctx));
+	obs_properties_destroy(props);
+	std::cout << "Repeated nested log button refresh checks passed\n";
+}
+
 int main()
 {
+	check_refresh_log_button();
 	check_live_log();
 	check_tab_compatibility();
 	socket_startup();

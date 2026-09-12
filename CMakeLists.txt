@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(propresenter-lyrics VERSION 0.1.0 LANGUAGES CXX)
+project(propresenter-lyrics VERSION 0.2.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

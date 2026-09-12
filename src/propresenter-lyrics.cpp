@@ -1415,42 +1415,11 @@ struct ProPresenterLyricsSource {
 	std::atomic<bool> discovery_cancel{false};
 	std::atomic<bool> scanning{false};
 	std::thread discovery_thread;
-	std::thread log_updates_thread;
-	std::mutex log_updates_mutex;
-	std::condition_variable log_updates_changed;
-	bool log_updates_stopped = false;
 
-	explicit ProPresenterLyricsSource(obs_source_t *source_) : source(source_), server(state) {}
+	explicit ProPresenterLyricsSource(obs_source_t *source_,
+		std::string log_path = module_config_file_path("propresenter-lyrics.log"))
+		: source(source_), logs(std::move(log_path)), server(state) {}
 };
-
-// No network or render thread waits for a properties refresh. Changes are
-// coalesced, and no refresh is emitted while the in-memory log is unchanged.
-static void start_log_updates(ProPresenterLyricsSource *ctx)
-{
-	ctx->log_updates_thread = std::thread([ctx] {
-		uint64_t published = 0;
-		std::unique_lock<std::mutex> lock(ctx->log_updates_mutex);
-		while (!ctx->log_updates_changed.wait_for(lock, std::chrono::milliseconds(500),
-			[ctx] { return ctx->log_updates_stopped; })) {
-			uint64_t revision = ctx->logs.revision();
-			if (revision == published) continue;
-			published = revision;
-			lock.unlock();
-			obs_source_update_properties(ctx->source);
-			lock.lock();
-		}
-	});
-}
-
-static void stop_log_updates(ProPresenterLyricsSource *ctx)
-{
-	{
-		std::lock_guard<std::mutex> lock(ctx->log_updates_mutex);
-		ctx->log_updates_stopped = true;
-	}
-	ctx->log_updates_changed.notify_all();
-	if (ctx->log_updates_thread.joinable()) ctx->log_updates_thread.join();
-}
 
 static std::string log_display_html(const std::string &text)
 {
@@ -1467,6 +1436,21 @@ static std::string log_display_html(const std::string &text)
 		}
 	}
 	return html + "</span>";
+}
+
+static bool refresh_log_display(obs_properties_t *props, obs_property_t *, void *data)
+{
+	auto *ctx = static_cast<ProPresenterLyricsSource *>(data);
+	if (!ctx)
+		return false;
+	auto *log = obs_properties_get(props, "live_connection_log");
+	if (!log)
+		return false;
+	// Rebuilding the source properties here deletes OBS's active button handler.
+	// Update the existing label and let the callback return queue the UI refresh.
+	const std::string html = log_display_html(ctx->logs.text());
+	obs_property_set_description(log, html.c_str());
+	return true;
 }
 
 static void start_discovery(ProPresenterLyricsSource *ctx)
@@ -1540,6 +1524,12 @@ static void read_settings(obs_data_t *data, Settings &settings)
 
 static void update_browser(ProPresenterLyricsSource *ctx)
 {
+	if (obs_get_source_output_flags("browser_source") == 0) {
+		ctx->logs.add("WARNING: OBS browser source is unavailable. Install or enable obs-browser; the overlay cannot render in this OBS build.");
+		blog(LOG_WARNING, "[propresenter-lyrics] OBS browser source is unavailable; overlay cannot render");
+		return;
+	}
+
 	obs_data_t *browser_settings = obs_data_create();
 	obs_data_set_string(browser_settings, "url", ctx->server.url().c_str());
 	obs_data_set_int(browser_settings, "width", ctx->settings.width);
@@ -1580,7 +1570,6 @@ static void *source_create(obs_data_t *settings, obs_source_t *source)
 			  },
 			  [ctx](const std::string &message) { ctx->logs.add(message); });
 	start_discovery(ctx);
-	start_log_updates(ctx);
 	return ctx;
 }
 
@@ -1589,7 +1578,6 @@ static void source_destroy(void *data)
 	auto *ctx = static_cast<ProPresenterLyricsSource *>(data);
 	if (!ctx)
 		return;
-	stop_log_updates(ctx);
 	ctx->discovery_cancel = true;
 	if (ctx->discovery_thread.joinable()) ctx->discovery_thread.join();
 	ctx->client.stop();
@@ -1818,6 +1806,7 @@ static obs_properties_t *source_properties(void *data)
 	std::string log_html = log_display_html(log_text);
 	auto *live_log = obs_properties_add_text(log, "live_connection_log", log_html.c_str(), OBS_TEXT_INFO);
 	obs_property_text_set_info_word_wrap(live_log, true);
+	obs_properties_add_button(log, "refresh_log_display", obs_module_text("RefreshLog"), refresh_log_display);
 	obs_properties_add_button(log, "open_log_file", obs_module_text("OpenLogFile"), open_log_file);
 	obs_properties_add_button(log, "open_log_folder", obs_module_text("OpenLogFolder"), open_log_folder);
 	obs_properties_add_group(connection, "log", obs_module_text("LiveConnectionLog"), OBS_GROUP_NORMAL, log);

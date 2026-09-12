@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 — 2026-09-12
+
+### Fixed
+
+- Replaced automatic log property refreshes with a **Refresh log** button to
+  avoid rebuilding the properties UI while its controls are active.
+- Added regression coverage for repeated log refreshes in nested settings groups.
+- Added a warning when OBS's browser source is unavailable and the overlay
+  cannot render.
+- Updated build and bundle version metadata to match the release version.
+
+## 0.2.0 — 2026-09-12
 
 ### Added
 

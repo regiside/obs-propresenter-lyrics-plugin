@@ -90,14 +90,14 @@ OBS tabs: **Connection**, **Size**, **Presets**, **Typography**, **Shadow**,
 **Line Background**, **Transitions**, and **Custom CSS**.
 
 A read-only **Live connection log** sits at the bottom of **Connection**. It
-shows the latest 14 messages from the source’s in-memory log and refreshes at
-most twice per second when new messages arrive, including while disconnected.
+shows the latest 14 messages from the source’s in-memory log. Click **Refresh
+log** to display the latest messages, including while disconnected.
 It does not read or tail the log file. **Open log file** and **Open log folder**
 remain available for longer history. Live messages are display-only and are
 not written into source settings.
 
-The current OBS properties API refreshes the properties view to update the log;
-updates are batched, and unchanged logs do not trigger refreshes.
+The refresh button updates the existing log label without rebuilding the source
+properties, keeping the active controls intact.
 
 OBS preserves the selected tab while the properties view refreshes, including
 when a discovery scan completes. Switching tabs does not change source settings
