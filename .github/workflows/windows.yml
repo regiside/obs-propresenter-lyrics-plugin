@@ -1,0 +1,65 @@
+name: Build Windows plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Plugin branch, tag, or commit to build
+        required: true
+        default: v0.2.1
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+      - name: Check out OBS SDK sources
+        uses: actions/checkout@v4
+        with:
+          repository: obsproject/obs-studio
+          ref: 32.1.2
+          submodules: recursive
+          path: build/obs-sdk-source
+      - name: Configure OBS SDK
+        working-directory: build/obs-sdk-source
+        run: >-
+          cmake --preset windows-x64
+          -DENABLE_PLUGINS=OFF -DENABLE_FRONTEND=OFF
+          -DENABLE_BROWSER=OFF -DENABLE_SCRIPTING=OFF
+          -DOBS_VERSION_OVERRIDE=32.1.2
+      - name: Build OBS SDK
+        run: cmake --build build/obs-sdk-source/build_x64 --target libobs --config RelWithDebInfo --parallel 4
+      - name: Configure plugin and tests
+        shell: pwsh
+        run: |
+          $sdk = "$env:GITHUB_WORKSPACE/build/obs-sdk-source"
+          $deps = "$sdk/.deps/obs-deps-2025-08-23-x64"
+          cmake --preset windows-x64 "-Dlibobs_DIR=$sdk/build_x64/libobs" "-DCMAKE_PREFIX_PATH=$deps" -DPROPRESENTER_BUILD_TESTS=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build plugin and tests
+        run: cmake --build --preset windows-x64
+      - name: Test
+        shell: pwsh
+        run: |
+          $sdk = "$env:GITHUB_WORKSPACE/build/obs-sdk-source"
+          $dllDirs = Get-ChildItem "$sdk/build_x64", "$sdk/.deps/obs-deps-2025-08-23-x64" -Filter *.dll -Recurse | ForEach-Object { $_.DirectoryName } | Sort-Object -Unique
+          $env:PATH = ($dllDirs -join ';') + ';' + $env:PATH
+          ctest --test-dir build/windows-x64 -C RelWithDebInfo --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install
+        run: cmake --install build/windows-x64 --prefix dist/windows-x64 --config RelWithDebInfo
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path dist/windows-x64/propresenter-lyrics -DestinationPath propresenter-lyrics-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: propresenter-lyrics-windows-x64
+          path: propresenter-lyrics-windows-x64.zip
+          if-no-files-found: error
